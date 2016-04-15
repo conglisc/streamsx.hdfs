@@ -13,7 +13,11 @@ import java.net.URISyntaxException;
 import java.net.UnknownHostException;
 import java.text.SimpleDateFormat;
 import java.util.Calendar;
+import java.util.Date;
 import java.util.List;
+import java.util.Set;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -55,8 +59,11 @@ public class HDFS2FileSink extends AbstractHdfsOperator implements StateHandler 
 	// use empty string
 	private String rawFileName = "";
 	private String file = null;
+	private String tempFile = "";
 	private String timeFormat = "yyyyMMdd_HHmmss";
 	private String currentFileName;
+	private String currentTempFileName = "";
+
 
 	private HdfsFile fFileToWrite;
 
@@ -158,6 +165,17 @@ public class HDFS2FileSink extends AbstractHdfsOperator implements StateHandler 
 		return file;
 	}
 
+	@Parameter(optional = true)
+	public void setTempFile(String tempFile) {
+		TRACE.log(TraceLevel.DEBUG, "setTempFile: " + tempFile);
+		this.tempFile = tempFile;
+	}
+
+	public String getTempFile() {
+		return tempFile;
+	}
+
+	
 	public String getCurrentFileName() {
 		return currentFileName;
 	}
@@ -314,11 +332,14 @@ public class HDFS2FileSink extends AbstractHdfsOperator implements StateHandler 
 		// check that the file sink is not at the start of the consistent region
 		OperatorContext opContext = checker.getOperatorContext();
 		ConsistentRegionContext crContext = opContext.getOptionalContext(ConsistentRegionContext.class);
-		if (crContext != null)
-		{
-			if (crContext.isStartOfRegion())
-			{
+		if (crContext != null) {
+			if (crContext.isStartOfRegion()) {
 				checker.setInvalidContext("The following operator cannot be the start of a consistent region: HDFS2FileSink.", null);
+			}
+			// check that tempFile parameter is not used in consistent region
+			Set<String> parameters = opContext.getParameterNames();
+			if (parameters.contains("tempFile")) {
+				checker.setInvalidContext("The following operator cannot use parameter tempFile if it is a member of a consistent region: HDFS2FileSink.", null);
 			}
 		}
 	}
@@ -328,6 +349,8 @@ public class HDFS2FileSink extends AbstractHdfsOperator implements StateHandler 
 			throws Exception {
 		List<String> paramValues = checker.getOperatorContext()
 				.getParameterValues("file");
+		List<String> tempFileValues = checker.getOperatorContext()
+				.getParameterValues("tempFile");
 		List<String> timeFormatValue = checker.getOperatorContext()
 				.getParameterValues("timeFormat");
 		if (timeFormatValue != null) {
@@ -343,8 +366,20 @@ public class HDFS2FileSink extends AbstractHdfsOperator implements StateHandler 
 				if (!fileValue.contains(IHdfsConstants.FILE_VAR_HOST)
 						&& !fileValue.contains(IHdfsConstants.FILE_VAR_PROCID)
 						&& !fileValue.contains(IHdfsConstants.FILE_VAR_PEID)
-						&& !fileValue
-								.contains(IHdfsConstants.FILE_VAR_PELAUNCHNUM)
+						&& !fileValue.contains(IHdfsConstants.FILE_VAR_PELAUNCHNUM)
+						&& !fileValue.contains(IHdfsConstants.FILE_VAR_TIME)
+						&& !fileValue.contains(IHdfsConstants.FILE_VAR_FILENUM)) {
+					throw new Exception(
+							"Unsupported % specification provided. Supported values are %HOST, %PEID, %FILENUM, %PROCID, %PELAUNCHNUM, %TIME");
+				}
+			}
+		}
+		for (String fileValue : tempFileValues) {
+			if (fileValue.contains(IHdfsConstants.FILE_VAR_PREFIX)) {
+				if (!fileValue.contains(IHdfsConstants.FILE_VAR_HOST)
+						&& !fileValue.contains(IHdfsConstants.FILE_VAR_PROCID)
+						&& !fileValue.contains(IHdfsConstants.FILE_VAR_PEID)
+						&& !fileValue.contains(IHdfsConstants.FILE_VAR_PELAUNCHNUM)
 						&& !fileValue.contains(IHdfsConstants.FILE_VAR_TIME)
 						&& !fileValue.contains(IHdfsConstants.FILE_VAR_FILENUM)) {
 					throw new Exception(
@@ -586,6 +621,12 @@ public class HDFS2FileSink extends AbstractHdfsOperator implements StateHandler 
 
 		super.initialize(context);
 		
+		// register for data governance
+		// only register if static filename mode
+		TRACE.log(TraceLevel.INFO, "HDFS2FileSink - Data Governance - file: " + file + " and HdfsUri: " + getHdfsUri());
+		if (fileAttrName == null && file != null && getHdfsUri() != null) {
+			registerForDataGovernance(getHdfsUri(), file);
+		}
 		
 		/*
 		 * Set appropriate variables if the optional output port is
@@ -639,8 +680,14 @@ public class HDFS2FileSink extends AbstractHdfsOperator implements StateHandler 
 		// Save the data type for later use.
 		dataType = inputSchema.getAttribute(dataIndex).getType().getMetaType();
 		if (!dynamicFilename) {
-			refreshCurrentFileName(file);
-			createFile(getCurrentFileName());
+			Date date = Calendar.getInstance().getTime();
+			currentFileName = refreshCurrentFileName(file, date, false);
+			if (tempFile.isEmpty()) {
+				createFile(currentFileName);
+			} else {
+				currentTempFileName	= refreshCurrentFileName(tempFile, date, true);
+				createFile(currentTempFileName);
+			}
 		}
 		
 		initRestarting(context);
@@ -649,6 +696,23 @@ public class HDFS2FileSink extends AbstractHdfsOperator implements StateHandler 
 		initState = new InitialState();
 	}
 
+	private void registerForDataGovernance(String serverURL, String file) {
+		TRACE.log(TraceLevel.INFO, "HDFS2FileSink - Registering for data governance with server URL: " + serverURL + " and file: " + file);						
+		
+		Map<String, String> properties = new HashMap<String, String>();
+		properties.put(IGovernanceConstants.TAG_REGISTER_TYPE, IGovernanceConstants.TAG_REGISTER_TYPE_OUTPUT);
+		properties.put(IGovernanceConstants.PROPERTY_OUTPUT_OPERATOR_TYPE, "HDFS2FileSink");
+		properties.put(IGovernanceConstants.PROPERTY_SRC_NAME, file);
+		properties.put(IGovernanceConstants.PROPERTY_SRC_TYPE, IGovernanceConstants.ASSET_HDFS_FILE_TYPE);
+		properties.put(IGovernanceConstants.PROPERTY_SRC_PARENT_PREFIX, "p1");
+		properties.put("p1" + IGovernanceConstants.PROPERTY_SRC_NAME, serverURL);
+		properties.put("p1" + IGovernanceConstants.PROPERTY_SRC_TYPE, IGovernanceConstants.ASSET_HDFS_SERVER_TYPE);
+		properties.put("p1" + IGovernanceConstants.PROPERTY_PARENT_TYPE, IGovernanceConstants.ASSET_HDFS_SERVER_TYPE_SHORT);
+		TRACE.log(TraceLevel.INFO, "HDFS2FileSink - Data governance: " + properties.toString());
+		
+		setTagData(IGovernanceConstants.TAG_OPERATOR_IGC, properties);				
+	}
+	
 	private void createFile(String filename) {
 		
 		if (TRACE.isLoggable(TraceLevel.DEBUG)) {
@@ -700,14 +764,14 @@ public class HDFS2FileSink extends AbstractHdfsOperator implements StateHandler 
 		fFileTimerThread.start();
 	}
 
-	private void refreshCurrentFileName(String baseName)
+	private String refreshCurrentFileName(String baseName, Date date, boolean isTempFile)
 			throws UnknownHostException {
 
 		// We must preserve the file parameter in order for us
 		// to support multi-file in the operator
 
 		// Check if % specification mentioned are valid or not
-		currentFileName = baseName;
+		String currentFileName = baseName;
 		if (currentFileName.contains(IHdfsConstants.FILE_VAR_PREFIX)) {
 			// Replace % specifications with relevant values.
 			currentFileName = currentFileName.replace(
@@ -723,19 +787,18 @@ public class HDFS2FileSink extends AbstractHdfsOperator implements StateHandler 
 					IHdfsConstants.FILE_VAR_PELAUNCHNUM, String
 							.valueOf(getOperatorContext().getPE()
 									.getRelaunchCount()));
-			Calendar cal = Calendar.getInstance();
 			SimpleDateFormat sdf = new SimpleDateFormat(timeFormat);
 			currentFileName = currentFileName.replace(
-					IHdfsConstants.FILE_VAR_TIME, sdf.format(cal.getTime()));		
-			
+					IHdfsConstants.FILE_VAR_TIME, sdf.format(date));
+			int anumber = fileNum;
+			if (isTempFile) anumber--; //temp files get the number of the last generated file name
 			currentFileName = currentFileName.replace(
-					IHdfsConstants.FILE_VAR_FILENUM, String.valueOf(fileNum));			
-			fileNum++;
+					IHdfsConstants.FILE_VAR_FILENUM, String.valueOf(anumber));
+			if ( ! isTempFile ) { //only the final file names increment 
+				fileNum++;
+			}
 		}
-	}
-
-	public int getNextFileNum() {
-		return fileNum++;
+		return currentFileName;
 	}
 
 	@Override
@@ -755,7 +818,7 @@ public class HDFS2FileSink extends AbstractHdfsOperator implements StateHandler 
 		}
 		// set the file to expire after punctuation
 		// on the next write, the file will be recreated
-		else if (isCloseOnPunct() && fFileToWrite != null) {
+		else if (isCloseOnPunct()) {
 
 			// This handles the closeOnPunct expiration policy
 			TRACE.log(TraceLevel.DEBUG, "Close on punct, close file.");
@@ -768,7 +831,7 @@ public class HDFS2FileSink extends AbstractHdfsOperator implements StateHandler 
 
 	private void closeFile() throws Exception {
 
-		TRACE.log(TraceLevel.DEBUG, "Close File");
+		TRACE.log(TraceLevel.DEBUG, "closeFile()");
 
 		// stop the timer thread.. and create a new one when a new file is
 		// created.
@@ -783,21 +846,41 @@ public class HDFS2FileSink extends AbstractHdfsOperator implements StateHandler 
 			fFileTimerThread = null;
 		}
 
-		TRACE.log(TraceLevel.DEBUG, "Set file as expired");
-
 		// If Optional output port is present output the filename and file
 		// size
 
 		synchronized (this) {
 			
-		    boolean alreadyExpired = fFileToWrite.isExpired();
-
-			fFileToWrite.setExpired();
-			fFileToWrite.close();
-
-			// operators can perform additional 
-			if (hasOutputPort && !alreadyExpired) {
-				submitOnOutputPort(fFileToWrite.getPath(), fFileToWrite.getSizeFromHdfs());
+			if (fFileToWrite != null) {
+				boolean alreadyClosed = fFileToWrite.isClosed();
+	
+				fFileToWrite.setExpired();
+				fFileToWrite.close();
+	
+				if ( ! alreadyClosed) {
+					String target = fFileToWrite.getPath();
+					boolean success = true;
+					if ( ! tempFile.isEmpty() ) {
+						target = currentFileName;
+						if (getHdfsClient().exists(target)) {
+							if (getHdfsClient().delete(target, false)) {
+								TRACE.log(TraceLevel.DEBUG, "Successfully removed file: " + target);
+							} else {
+								TRACE.log(TraceLevel.ERROR, "Failed to removed file: " + target);
+							}
+						}
+						if (getHdfsClient().rename(currentTempFileName, target)) {
+							TRACE.log(TraceLevel.DEBUG, "Successfully renamed file: " + currentTempFileName +" to: " + target);
+						} else {
+							success = false;
+							TRACE.log(TraceLevel.ERROR, "Failed to rename file: " + currentTempFileName +" to: " + target);
+						}
+					}
+					// operators can perform additional 
+					if (hasOutputPort && success) {
+						submitOnOutputPort(target, fFileToWrite.getSizeFromHdfs());
+					}
+				}
 			}
 		}
 
@@ -821,11 +904,17 @@ public class HDFS2FileSink extends AbstractHdfsOperator implements StateHandler 
 			if (rawFileName == null || rawFileName.isEmpty()) {
 				// the first tuple. No raw file name is set.
 				rawFileName = filenameString;
-				refreshCurrentFileName(rawFileName);
-				createFile(getCurrentFileName());
+				Date date = Calendar.getInstance().getTime();
+				currentFileName = refreshCurrentFileName(rawFileName, date, false);
+				String realName = currentFileName;
+				if ( ! tempFile.isEmpty()) {
+					currentTempFileName	= refreshCurrentFileName(tempFile, date, true);
+					realName = currentTempFileName;
+				}
+				createFile(realName);
 				if (TRACE.isLoggable(Level.INFO))
 					TRACE.info("Created first file " + currentFileName
-							+ " from raw " + rawFileName);
+							+ " from raw " + rawFileName + " real fileName " + realName);
 			}
 
 			if (!rawFileName.equals(filenameString)) {
@@ -833,11 +922,17 @@ public class HDFS2FileSink extends AbstractHdfsOperator implements StateHandler 
 				// first tuple.
 				closeFile();
 				rawFileName = filenameString;
-				refreshCurrentFileName(rawFileName);
+				Date date = Calendar.getInstance().getTime();
+				currentFileName = refreshCurrentFileName(rawFileName, date, false);
+				String realName = currentFileName;
+				if ( ! tempFile.isEmpty()) {
+					currentTempFileName	= refreshCurrentFileName(tempFile, date, true);
+					realName = currentTempFileName;
+				}
+				createFile(realName);
 				if (TRACE.isLoggable(Level.INFO))
 					TRACE.info("Updating filename -- new name is "
-							+ currentFileName + " from raw " + rawFileName);
-				createFile(getCurrentFileName());
+							+ currentFileName + " from raw " + rawFileName+ " real fileName " + realName);
 			}
 			// When we leave this block, we know the file is ready to be written
 			// to.
@@ -847,22 +942,21 @@ public class HDFS2FileSink extends AbstractHdfsOperator implements StateHandler 
 
 			if (fFileToWrite.isExpired()) {
 				// these calls will set fFileToWrite to the new file
-				refreshCurrentFileName(file);
-				createFile(getCurrentFileName());
+				Date date = Calendar.getInstance().getTime();
+				currentFileName = refreshCurrentFileName(file, date, false);
+				String realName = currentFileName;
+				if ( ! tempFile.isEmpty()) {
+					currentTempFileName	= refreshCurrentFileName(tempFile, date, true);
+
+					realName = currentTempFileName;
+				}
+				createFile(realName);
 			}
 
 			fFileToWrite.writeTuple(tuple);
 			// This will check bytesPerFile and tuplesPerFile expiration policy
 			if (fFileToWrite.isExpired()) {
-
-				fFileToWrite.close();
-
-				// If Optional output port is present output the filename and
-				// file size
-				if (hasOutputPort) {
-					submitOnOutputPort(fFileToWrite.getPath(),
-							fFileToWrite.getSizeFromHdfs());
-				}
+				closeFile();
 			}
 
 		}
@@ -983,7 +1077,7 @@ public class HDFS2FileSink extends AbstractHdfsOperator implements StateHandler 
 		TRACE.log(TraceLevel.DEBUG,
 				"Reset to checkpoint " + checkpoint.getSequenceId(),
 				CONSISTEN_ASPECT);	
-		
+
 		// close current file
 		if (fFileToWrite != null)
 			closeFile();
@@ -1017,7 +1111,7 @@ public class HDFS2FileSink extends AbstractHdfsOperator implements StateHandler 
 
 	@Override
 	public void resetToInitialState() throws Exception {
-		TRACE.log(TraceLevel.DEBUG, "Reset to initial state", CONSISTEN_ASPECT);				
+		TRACE.log(TraceLevel.DEBUG, "Reset to initial state", CONSISTEN_ASPECT);
 
 		// close current file
 		if (fFileToWrite != null)
@@ -1056,7 +1150,7 @@ public class HDFS2FileSink extends AbstractHdfsOperator implements StateHandler 
 
 	@Override
 	public void retireCheckpoint(long id) throws Exception {
-		TRACE.log(TraceLevel.DEBUG, "Retire checkpoint", CONSISTEN_ASPECT);		
+		TRACE.log(TraceLevel.DEBUG, "Retire checkpoint", CONSISTEN_ASPECT);
 	}
 	
 	private boolean isRestarting()
@@ -1066,7 +1160,7 @@ public class HDFS2FileSink extends AbstractHdfsOperator implements StateHandler 
 	
 	private void initRestarting(OperatorContext opContext)
 	{
-		TRACE.log(TraceLevel.DEBUG, "restarting set to true", CONSISTEN_ASPECT);		
+		TRACE.log(TraceLevel.DEBUG, "restarting set to true", CONSISTEN_ASPECT);
 		isRestarting = false;
 		if (crContext != null )
 		{
@@ -1091,7 +1185,8 @@ public class HDFS2FileSink extends AbstractHdfsOperator implements StateHandler 
 		while (!shutdownRequested)
 		{			
 			try {
-				OutputTuple tuple = outputPortQueue.take();			
+				//System.out.println("process()!!!!!!.");
+				OutputTuple tuple = outputPortQueue.take();
 				if (outputPort != null)
 				{
 					
